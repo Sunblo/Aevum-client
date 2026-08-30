@@ -1,0 +1,6 @@
+target/
+
+# Minecraft test debris
+crash-reports/
+logs/
+tw*.png
