@@ -518,6 +518,72 @@ fn validate_jvm(java: &Path, heap_mb: u32) -> Result<(), String> {
     }
 }
 
+/// Parse the installed Java's major version from `java -version`.
+/// Handles both `openjdk version "17.0.5"` and legacy `java version "1.8.0_352"`.
+fn java_major_version(java: &Path) -> Result<u16, String> {
+    let out = Command::new(java)
+        .arg("-version")
+        .output()
+        .map_err(|e| format!("failed to run java ({})", e))?;
+    let raw = if out.stderr.is_empty() {
+        out.stdout
+    } else {
+        out.stderr
+    };
+    let s = String::from_utf8_lossy(&raw);
+    for line in s.lines() {
+        let line = line.trim();
+        let start = match line.find("version \"") {
+            Some(i) => i + "version \"".len(),
+            None => continue,
+        };
+        let rest = match line[start..].find('"') {
+            Some(end) => &line[start..start + end],
+            None => &line[start..],
+        };
+        let mut it = rest.split('.');
+        let first = it.next().unwrap_or("").parse::<u16>().unwrap_or(0);
+        if first == 1 {
+            // Legacy naming: "1.8.0_352" -> Java 8.
+            if let Some(second) = it.next() {
+                if let Ok(v) = second.parse::<u16>() {
+                    return Ok(v);
+                }
+            }
+            return Ok(first);
+        }
+        return Ok(first);
+    }
+    Err("could not parse `java -version` output".into())
+}
+
+/// Drop any JVM arg the installed JVM rejects. Newer Minecraft versions ship
+/// experimental flags (e.g. `--sun-misc-unsafe-memory-access=allow`,
+/// `--enable-native-access=ALL-UNNAMED`) that older JVMs refuse with
+/// "Unrecognized option"; without this the whole launch dies on the first
+/// unsupported flag. Probes `java <args> -version` and removes offenders.
+fn strip_unsupported_jvm_args(java: &Path, jvm: &mut Vec<String>) {
+    loop {
+        let out = match Command::new(java).args(jvm.iter()).arg("-version").output() {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+        if out.status.success() {
+            return;
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let offending = stderr
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Unrecognized option: ").map(|s| s.trim().to_string()));
+        let Some(offending) = offending else { return };
+        if let Some(pos) = jvm.iter().position(|a| *a == offending) {
+            jvm.remove(pos);
+        } else {
+            return;
+        }
+    }
+}
+
 fn rules_allow(rules: &[Value]) -> bool {
     if rules.is_empty() {
         return true;
@@ -676,6 +742,7 @@ fn build_command(
     asset_index_id: &str,
     version: &str,
     vtype: &str,
+    java: Option<&Path>,
 ) -> Result<Vec<String>, String> {
     let uuid = offline_uuid(&prof.username);
 
@@ -749,6 +816,10 @@ fn build_command(
         .and_then(|m| m.as_str())
         .unwrap_or("net.minecraft.client.main.Main")
         .to_string();
+
+    if let Some(j) = java {
+        strip_unsupported_jvm_args(j, &mut jvm);
+    }
 
     let mut full = Vec::new();
     full.extend(jvm);
@@ -902,6 +973,26 @@ fn do_launch(profile: &Profile, report: &Arc<Mutex<LaunchReport>>) -> Result<(),
         "No Java runtime found. Install Java 17 or newer (Java 21 recommended) and ensure it is on PATH or set JAVA_HOME.".to_string()
     })?;
 
+    // Newer versions ship JVM flags older runtimes reject (e.g. 26.2's
+    // `--sun-misc-unsafe-memory-access=allow` needs Java 22+). Fail fast with a
+    // clear message instead of the JVM's own "Unrecognized option" crash.
+    if let Some(req) = vj
+        .get("javaVersion")
+        .and_then(|j| j.get("majorVersion"))
+        .and_then(|m| m.as_u64())
+    {
+        if let Ok(found) = java_major_version(&java) {
+            if (found as u64) < req {
+                return Err(format!(
+                    "{} requires Java {} but the installed Java is version {}. \
+                     Install a matching 64-bit Java runtime (Java {} or newer), \
+                     restart the launcher, and try again.",
+                    version, req, found, req
+                ));
+            }
+        }
+    }
+
     if cfg!(target_os = "linux") {
         let has_display = std::env::var("DISPLAY")
             .map(|d| !d.trim().is_empty())
@@ -972,7 +1063,7 @@ fn do_launch(profile: &Profile, report: &Arc<Mutex<LaunchReport>>) -> Result<(),
 
     let mut eff_profile = profile.clone();
     eff_profile.ram_mb = heap_mb;
-    let cmd = build_command(&eff_profile, &vj, &classpath, &nat_dir, &asset_index_id, &version, &vtype)?;
+    let cmd = build_command(&eff_profile, &vj, &classpath, &nat_dir, &asset_index_id, &version, &vtype, Some(&java))?;
 
     set(
         report,
@@ -1039,5 +1130,28 @@ mod tests {
         let trailer = note.find("A fatal exception").unwrap();
         assert!(cause < trailer, "exception line must precede trailer:\n{note}");
         std::fs::write(&log, saved).ok();
+    }
+
+    #[test]
+    fn java_major_version_parses() {
+        let Some(java) = find_java() else {
+            return; // no java installed in this environment; nothing to assert
+        };
+        let v = java_major_version(&java).unwrap();
+        assert!(v >= 8, "unexpected java major {v}");
+    }
+
+    #[test]
+    fn strips_unsupported_jvm_args() {
+        let Some(java) = find_java() else {
+            return; // no java installed in this environment; nothing to assert
+        };
+        let mut args = vec![
+            "-Xmx1G".to_string(),
+            "--definitely-not-a-real-jvm-flag=1".to_string(),
+            "-Dfoo=bar".to_string(),
+        ];
+        strip_unsupported_jvm_args(&java, &mut args);
+        assert_eq!(args, vec!["-Xmx1G".to_string(), "-Dfoo=bar".to_string()]);
     }
 }
