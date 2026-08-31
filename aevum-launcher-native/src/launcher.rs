@@ -593,8 +593,7 @@ fn rules_allow(rules: &[Value]) -> bool {
     let mut allow = false;
     for r in rules {
         let action = r.get("action").and_then(|a| a.as_str()).unwrap_or("allow");
-        let os_obj = r.get("os");
-        let matches = match os_obj {
+        let matches = match r.get("os") {
             Some(o) => {
                 let name_ok = match o.get("name").and_then(|n| n.as_str()) {
                     Some(n) => n == os,
@@ -608,7 +607,19 @@ fn rules_allow(rules: &[Value]) -> bool {
             }
             None => true,
         };
-        if matches {
+        // This launcher never enables launcher features (no demo mode, no
+        // custom resolution, no quick play), so any rule that requires a
+        // feature to be true (e.g. 26.2's quick-play args) must not match.
+        // Otherwise all four --quickPlay* options are passed at once and the
+        // game aborts with "Only one quick play option can be specified".
+        let features_ok = match r.get("features") {
+            Some(f) => match f.as_object() {
+                Some(obj) => obj.values().all(|v| v.as_bool() == Some(false)),
+                None => true,
+            },
+            None => true,
+        };
+        if matches && features_ok {
             allow = action == "allow";
         }
     }
@@ -1139,6 +1150,18 @@ mod tests {
         };
         let v = java_major_version(&java).unwrap();
         assert!(v >= 8, "unexpected java major {v}");
+    }
+
+    #[test]
+    fn feature_gated_rules_never_match() {
+        let quick_play: Vec<Value> = serde_json::from_str(r#"[{"action":"allow","features":{"is_quick_play_singleplayer":true},"value":["--quickPlaySingleplayer","x"]}]"#).unwrap();
+        assert!(!rules_allow(&quick_play), "feature=required true must not match");
+
+        let demo: Vec<Value> = serde_json::from_str(r#"[{"action":"allow","features":{"is_demo_user":true}}]"#).unwrap();
+        assert!(!rules_allow(&demo), "demo rule must not match");
+
+        let plain_os: Vec<Value> = serde_json::from_str(r#"[{"action":"allow","os":{"name":"linux"}}]"#).unwrap();
+        assert!(rules_allow(&plain_os), "plain os rule still matches");
     }
 
     #[test]
