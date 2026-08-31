@@ -9,6 +9,8 @@ A native, space-themed Minecraft client launcher with a Lunar-style UI, written 
 - Offline-style profile (username → md5 UUID), 1.16.5 validated end-to-end on Java 17
 - Native OS rule handling for libraries (e.g. macOS-only JVM flags are not leaked onto Linux)
 - Game output capture: the client's stdout/stderr are written to `game/logs/latest.log` under the launcher data dir
+- Crash diagnostics: on a non-zero exit the launcher extracts the real exception from the log/crash-report, shows it in the UI, and writes it to `game/logs/crash-latest.txt`
+- JVM pre-flight check: validates the requested `-Xmx` heap against the installed Java and auto-tunes it down if the VM cannot be created
 - Custom boot animation with phase-by-phase progress sequence, toasts, and launch overlay
 - Frameless window with a custom title bar (minimize / maximize / close)
 - Space ambience: deterministic LCG starfield + soft glow accents
@@ -20,8 +22,9 @@ A native, space-themed Minecraft client launcher with a Lunar-style UI, written 
 ## Requirements
 
 - Java 17+ on `PATH` (the client needs it; the launcher locates `java` automatically). Tested with OpenJDK 17.0.20.
+- The launcher probes the JVM before launch: if the requested heap cannot be created (common on low-RAM machines, WSL2 memory caps, or 32-bit JVMs — java exits with "Could not create the Java Virtual Machine"), it automatically retries with smaller heap sizes down to 512 MB.
 - On Linux, the game window needs an X display; run under Xvfb when headless (see Run).
-- Windows note: the launcher builds a `;`-separated classpath on Windows and `:` on Unix/macOS.
+- Windows: build with `cargo build --release` to get `target/release/aevum-launcher.exe`. A `;`-separated classpath is used on Windows, `:` on Unix/macOS. Use a 64-bit Java runtime.
 
 ## Data & cache
 
@@ -32,6 +35,7 @@ Everything is stored under `~/.aevum-launcher/`:
 - `assets/` — indexed asset objects (textures, sounds)
 - `natives/<id>/` — extracted platform natives
 - `game/logs/latest.log` — captured game output
+- `game/logs/crash-latest.txt` — last crash summary extracted for the UI
 - `game/crash-reports/` — Minecraft crash reports
 
 ## Build

@@ -35,6 +35,8 @@ pub struct LaunchReport {
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
+    /// Tail of the game log + crash-report summary when the game exits non-zero.
+    pub crash_tail: Option<String>,
 }
 
 impl LaunchReport {
@@ -46,6 +48,7 @@ impl LaunchReport {
     }
 }
 
+#[derive(Clone)]
 pub struct Profile {
     pub version_id: String,
     pub username: String,
@@ -170,7 +173,192 @@ fn set_exited(report: &Arc<Mutex<LaunchReport>>, code: Option<i32>) {
         r.phase = Phase::Exited;
         r.exit_code = code;
         r.pid = None;
+        if code != Some(0) {
+            r.crash_tail = game_exit_note();
+        }
     }
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_esc = false;
+    for ch in s.chars() {
+        if in_esc {
+            if ch == 'm' {
+                in_esc = false;
+            }
+            continue;
+        }
+        if ch == '\x1b' {
+            in_esc = true;
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Priority of a log line as crash evidence. Lower = more important.
+fn line_priority(l: &str) -> Option<u8> {
+    let up = l.to_uppercase();
+    if up.contains("EXCEPTION IN THREAD")
+        || up.contains("FATAL ERROR")
+        || up.contains("ERROR IN THREAD")
+    {
+        Some(0)
+    } else if l.starts_with("java.")
+        || up.starts_with("CAUSED BY")
+        || up.contains("UNSATISFIEDLINK")
+        || up.contains("NOCLASSDEF")
+    {
+        Some(1)
+    } else if up.contains("GLFW") {
+        Some(2)
+    } else if up.contains("PROGRAM WILL EXIT") || up.contains("A FATAL EXCEPTION") {
+        Some(8)
+    } else if up.contains("UNRECOGNIZED OPTION")
+        || up.contains("COULD NOT CREATE")
+        || up.contains("INITIALIZATION OF VM")
+        || up.contains("RESERVE ENOUGH SPACE")
+        || up.contains("INSIDE JVM")
+        || up.contains("UNSUPPORTED")
+        || up.contains("OUTOFMEMORY")
+        || up.contains("ACCESSDENIED")
+    {
+        Some(1)
+    } else if up.contains("EXCEPTION") || up.contains("FATAL") {
+        Some(3)
+    } else if up.contains("ERROR") {
+        Some(4)
+    } else if up.contains("FAILED") {
+        Some(5)
+    } else if up.trim_start().starts_with("at ") || up.trim_start().starts_with("...") {
+        Some(6)
+    } else {
+        None
+    }
+}
+
+/// Extract a readable crash summary from the game's log and crash-reports.
+fn game_exit_note() -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Tail of latest.log: pick the highest-priority evidence lines in order.
+    let log_path = game_dir().join("logs").join("latest.log");
+    if let Ok(f) = std::fs::File::open(&log_path) {
+        use std::io::{BufRead, BufReader, Seek, SeekFrom};
+        let len = f.metadata().ok().map(|m| m.len()).unwrap_or(0);
+        let start = len.saturating_sub(128 * 1024);
+        let mut br = BufReader::new(f);
+        let _ = br.seek(SeekFrom::Start(start));
+        let lines: Vec<String> = br
+            .lines()
+            .flatten()
+            .map(|l| strip_ansi(&l))
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        let lines = if lines.len() > 500 {
+            lines[lines.len() - 500..].to_vec()
+        } else {
+            lines
+        };
+
+        let mut scored: Vec<(u8, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for l in lines.iter() {
+            if let Some(p) = line_priority(l) {
+                let key = l.trim().to_string();
+                if seen.insert(key) {
+                    scored.push((p, l.clone()));
+                }
+            }
+        }
+        scored.sort_by_key(|(p, _)| *p);
+        let mut joined: String = String::new();
+        for (_, l) in scored.iter().take(8) {
+            let mut line = l.trim().to_string();
+            if line.len() > 220 {
+                line.truncate(220);
+            }
+            if !joined.is_empty() {
+                joined.push('\n');
+            }
+            joined.push_str(&line);
+        }
+        if joined.is_empty() {
+            joined = lines.iter().rev().take(6).cloned().collect::<Vec<_>>().join("\n");
+        }
+        if joined.len() > 1600 {
+            joined.truncate(1600);
+        }
+        if !joined.trim().is_empty() {
+            parts.push(joined);
+        }
+    }
+
+    // Newest crash-report, if any: grab the description and first exception.
+    if let Ok(rd) = std::fs::read_dir(game_dir().join("crash-reports")) {
+        let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("txt") {
+                continue;
+            }
+            if let Ok(meta) = e.metadata() {
+                if let Ok(t) = meta.modified() {
+                    if newest.as_ref().map(|(nt, _)| t > *nt).unwrap_or(true) {
+                        newest = Some((t, p));
+                    }
+                }
+            }
+        }
+        if let Some((_, p)) = newest {
+            if let Ok(content) = std::fs::read_to_string(p) {
+                let mut summary = String::new();
+                let mut desc: Option<String> = None;
+                let mut exc: Option<String> = None;
+                for line in content.lines().take(24) {
+                    let t = line.trim();
+                    if desc.is_none() && t.starts_with("Description:") {
+                        desc = Some(t.trim_start_matches("Description:").trim().to_string());
+                    }
+                    if exc.is_none() && t.starts_with("java.") && t.contains("Exception") {
+                        exc = Some(t.to_string());
+                    }
+                }
+                if let Some(d) = desc {
+                    summary.push_str(&format!("crash-reports: {}", d));
+                    if let Some(e) = &exc {
+                        summary.push_str(&format!(" — {}", e));
+                    }
+                }
+                if !summary.is_empty() {
+                    parts.push(summary);
+                }
+            }
+        }
+    }
+
+    let summary = if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    };
+
+    // Persist a copy the user can open/copy: game/logs/crash-latest.txt
+    if let Some(s) = &summary {
+        use std::io::Write;
+        let crash_file = game_dir().join("logs").join("crash-latest.txt");
+        if let Some(parent) = crash_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut f) = std::fs::File::create(crash_file) {
+            let _ = f.write_all(s.as_bytes());
+            let _ = f.write_all(b"\n");
+        }
+    }
+
+    summary
 }
 
 fn file_sha1(path: &Path) -> Result<String, String> {
@@ -299,6 +487,35 @@ fn find_java() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Collapse multi-line process output into a single line for UI messages.
+fn one_line(s: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        return "unknown error".to_string();
+    }
+    t.lines().rev().find(|l| !l.trim().is_empty()).map(|l| l.trim().to_string()).unwrap_or_default()
+}
+
+/// Check the JVM can actually create a VM with the given max heap.
+/// Runs `java -Xmx<heap>M -version`; the heap is reserved up front, so this
+/// reproduces "Could not create the Java Virtual Machine" failures exactly.
+fn validate_jvm(java: &Path, heap_mb: u32) -> Result<(), String> {
+    let out = Command::new(java)
+        .arg(format!("-Xmx{}M", heap_mb.max(256)))
+        .arg("-version")
+        .output()
+        .map_err(|e| format!("failed to run java ({})", e))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if stderr.is_empty() {
+        Err(format!("JVM rejected a {} MB heap", heap_mb))
+    } else {
+        Err(stderr)
+    }
 }
 
 fn rules_allow(rules: &[Value]) -> bool {
@@ -685,6 +902,62 @@ fn do_launch(profile: &Profile, report: &Arc<Mutex<LaunchReport>>) -> Result<(),
         "No Java runtime found. Install Java 17 or newer (Java 21 recommended) and ensure it is on PATH or set JAVA_HOME.".to_string()
     })?;
 
+    if cfg!(target_os = "linux") {
+        let has_display = std::env::var("DISPLAY")
+            .map(|d| !d.trim().is_empty())
+            .unwrap_or(false);
+        let has_wayland = std::env::var("WAYLAND_DISPLAY")
+            .map(|d| !d.trim().is_empty())
+            .unwrap_or(false);
+        if !has_display && !has_wayland {
+            return Err(
+                "No display server available (DISPLAY/WAYLAND_DISPLAY is not set). \
+                 Minecraft opens its own window, so it needs a graphical desktop session. \
+                 Launch from a desktop environment, or export DISPLAY (e.g. ':0')."
+                    .to_string(),
+            );
+        }
+    }
+
+    // The JVM reserves the requested max heap up front. On machines with little RAM
+    // (or a 32-bit JVM) a large -Xmx makes java exit with "Could not create the Java
+    // Virtual Machine". Probe the JVM with the requested heap and fall back to smaller
+    // values so the game can still start.
+    let requested_heap = profile.ram_mb.max(256);
+    let mut heap_mb = requested_heap;
+    match validate_jvm(&java, heap_mb) {
+        Ok(()) => {}
+        Err(raw) => {
+            let mut recovered: Option<u32> = None;
+            while heap_mb > 512 {
+                heap_mb /= 2;
+                if validate_jvm(&java, heap_mb).is_ok() {
+                    recovered = Some(heap_mb);
+                    break;
+                }
+            }
+            if let Some(m) = recovered {
+                set(
+                    report,
+                    Phase::Launching,
+                    format!(
+                        "{} MB heap unavailable ({}) — using {} MB",
+                        requested_heap,
+                        one_line(&raw),
+                        m
+                    ),
+                );
+            } else {
+                return Err(format!(
+                    "Java could not create a virtual machine with any heap size. \
+                     Last error: {}. Install a 64-bit Java runtime (Java 17 or newer) \
+                     with enough RAM for Minecraft.",
+                    one_line(&raw)
+                ));
+            }
+        }
+    }
+
     let mut cp: Vec<PathBuf> = libs
         .iter()
         .map(|(path, _, _, _)| libs_dir().join(path))
@@ -697,7 +970,9 @@ fn do_launch(profile: &Profile, report: &Arc<Mutex<LaunchReport>>) -> Result<(),
         .collect::<Vec<_>>()
         .join(sep);
 
-    let cmd = build_command(profile, &vj, &classpath, &nat_dir, &asset_index_id, &version, &vtype)?;
+    let mut eff_profile = profile.clone();
+    eff_profile.ram_mb = heap_mb;
+    let cmd = build_command(&eff_profile, &vj, &classpath, &nat_dir, &asset_index_id, &version, &vtype)?;
 
     set(
         report,
@@ -736,5 +1011,33 @@ pub fn kill_pid(pid: u32) {
         let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).status();
     } else {
         let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn crash_note_prioritizes_exception_over_trailer() {
+        let log = game_dir().join("logs").join("latest.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let saved = std::fs::read_to_string(&log).unwrap_or_default();
+        {
+            let mut f = std::fs::File::create(&log).unwrap();
+            let _ = f.write_all(b"[12:00:00] [Render thread/INFO]: Setting user: NovaPilot\n");
+            let _ = f.write_all(b"Exception in thread \"main\" java.lang.UnsatisfiedLinkError: Could not load library\n");
+            let _ = f.write_all(b"\tat com.mojang.foo.bar(SourceFile:1)\n");
+            let _ = f.write_all(b"Caused by: java.lang.ExceptionInInitializerError\n");
+            let _ = f.write_all(b"A fatal exception has occurred. Program will exit.\n");
+        }
+        let note = game_exit_note().expect("note should be produced");
+        assert!(note.contains("UnsatisfiedLinkError"), "missing cause: {note}");
+        assert!(note.contains("A fatal exception has occurred"));
+        let cause = note.find("UnsatisfiedLinkError").unwrap();
+        let trailer = note.find("A fatal exception").unwrap();
+        assert!(cause < trailer, "exception line must precede trailer:\n{note}");
+        std::fs::write(&log, saved).ok();
     }
 }

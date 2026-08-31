@@ -29,6 +29,33 @@ const BOOT_PHASES: &[(&str, u8)] = &[
     ("All systems nominal", 100),
 ];
 
+/// Turn one line from the game log / crash report into a brief, readable cause.
+fn short_crash(line: &str) -> String {
+    let t = line.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if t.contains("Failed to initialize GLFW") || t.contains("GLFW error") {
+        return "Failed to initialize GLFW — the game could not open a window. \
+                Run from a desktop session with a working display / GPU driver."
+            .to_string();
+    }
+    let msg = if let Some(i) = t.find("Exception: ") {
+        t[i + 11..].to_string()
+    } else if let Some(i) = t.find("Exception") {
+        t[i..].to_string()
+    } else if let Some(i) = t.find(": ") {
+        t[i + 2..].to_string()
+    } else {
+        t.to_string()
+    };
+    let mut out: Vec<char> = msg.chars().take(120).collect();
+    if msg.chars().count() > 120 {
+        out.extend("…".chars());
+    }
+    out.into_iter().collect()
+}
+
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum View {
     Play,
@@ -135,7 +162,7 @@ impl AevumApp {
             manifest,
             username,
             selected_version,
-            mem_gb: 4.0,
+            mem_gb: 2.0,
             launch_report: Arc::new(Mutex::new(launcher::LaunchReport::default())),
             launch_thread: None,
             last_phase: launcher::Phase::Idle,
@@ -358,14 +385,34 @@ impl eframe::App for AevumApp {
         // Fire one-shot toasts on launch state transitions.
         let current_phase = self.launch_report.lock().map(|r| r.phase).unwrap_or(launcher::Phase::Idle);
         if current_phase != self.last_phase {
-            match current_phase {
-                launcher::Phase::Running => {
+            match current_phase {                launcher::Phase::Running => {
                     let pid = self.launch_report.lock().unwrap().pid.unwrap_or(0);
                     self.toast(format!("Game launched — process {}", pid));
                 }
                 launcher::Phase::Exited => {
-                    let code = self.launch_report.lock().unwrap().exit_code.unwrap_or(-1);
-                    self.toast(format!("Game closed (exit code {})", code));
+                    let (code, brief) = {
+                        let report = self.launch_report.lock().unwrap();
+                        let code = report.exit_code.unwrap_or(-1);
+                        let brief = if code != 0 {
+                            report
+                                .crash_tail
+                                .as_ref()
+                                .and_then(|t| t.lines().next().map(|l| short_crash(l)))
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        (code, brief)
+                    };
+                    if code != 0 {
+                        if brief.is_empty() {
+                            self.toast(format!("Game crashed (exit code {}) — see game/logs/latest.log", code));
+                        } else {
+                            self.toast(format!("Game crashed (exit code {}): {}", code, brief));
+                        }
+                    } else {
+                        self.toast(format!("Game closed (exit code {})", code));
+                    }
                 }
                 launcher::Phase::Error => {
                     let msg = self
@@ -1065,6 +1112,20 @@ impl AevumApp {
         let report = self.launch_report.lock().unwrap();
         let status_msg = if report.error.is_some() {
             report.error.clone().unwrap_or_default()
+        } else if report.phase == launcher::Phase::Exited && report.exit_code != Some(0) {
+            if let Some(tail) = &report.crash_tail {
+                tail.lines().next().map(|l| short_crash(l)).unwrap_or_else(|| {
+                    format!(
+                        "Crashed with exit code {} — see game/logs/latest.log",
+                        report.exit_code.unwrap_or(-1)
+                    )
+                })
+            } else {
+                format!(
+                    "Crashed with exit code {} — see game/logs/latest.log",
+                    report.exit_code.unwrap_or(-1)
+                )
+            }
         } else if !report.message.is_empty() {
             report.message.clone()
         } else {
@@ -1085,7 +1146,12 @@ impl AevumApp {
         drop(report);
 
         paint::text(&painter, pos2(cx, r.min.y + 205.0), "Aevum Launcher", theme::display(15.0), theme::TEXT);
-        paint::text(&painter, pos2(cx, r.min.y + 226.0), &status_msg, theme::body(12.0), theme::TEXT_DIM);
+        let mut status_display = status_msg;
+        if status_display.chars().count() > 64 {
+            let head: String = status_display.chars().take(61).collect();
+            status_display = format!("{}…", head);
+        }
+        paint::text(&painter, pos2(cx, r.min.y + 226.0), &status_display, theme::body(12.0), theme::TEXT_DIM);
 
         // progress bar
         let bar = Rect::from_center_size(pos2(cx, r.min.y + 250.0), vec2(320.0, 4.0));
@@ -1545,39 +1611,44 @@ impl AevumApp {
     //  Launch overlay
     // =========================================================
     fn launch_ui(&mut self, ctx: &egui::Context) {
-        let report = self.launch_report.lock();
-        let report = match report {
-            Ok(r) => r,
-            Err(_) => return,
+        let (phase, msg, pct, pid, exit, err, crash_tail, files_done, files_total, active, k) = {
+            let report = match self.launch_report.lock() {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let phase = report.phase;
+            if phase == launcher::Phase::Idle {
+                return;
+            }
+            let active = matches!(
+                phase,
+                launcher::Phase::Fetching
+                    | launcher::Phase::Downloading
+                    | launcher::Phase::Extracting
+                    | launcher::Phase::Launching
+                    | launcher::Phase::Running
+            );
+            let k = ctx.animate_bool(Id::new("launch_fade"), active);
+            (
+                phase,
+                report.message.clone(),
+                report.progress_pct(),
+                report.pid,
+                report.exit_code,
+                report.error.clone(),
+                report.crash_tail.clone(),
+                report.files_done,
+                report.files_total,
+                active,
+                k,
+            )
         };
-        let phase = report.phase;
-        if phase == launcher::Phase::Idle {
-            return;
-        }
-
-        let active = matches!(
-            phase,
-            launcher::Phase::Fetching
-                | launcher::Phase::Downloading
-                | launcher::Phase::Extracting
-                | launcher::Phase::Launching
-                | launcher::Phase::Running
-        );
-        let k = ctx.animate_bool(Id::new("launch_fade"), active);
-
-        let msg = report.message.clone();
-        let pct = report.progress_pct();
-        let pid = report.pid;
-        let exit = report.exit_code;
-        let err = report.error.clone();
-        let files_done = report.files_done;
-        let files_total = report.files_total;
-        drop(report);
 
         let sr = ctx.screen_rect();
         let c = sr.center();
         let t = self.time;
         let mut dismiss = false;
+        let mut copy_requested = false;
 
         egui::Area::new(Id::new("launch_overlay"))
             .order(Order::Foreground)
@@ -1648,6 +1719,81 @@ impl AevumApp {
                             theme::TEXT_FAINT.gamma_multiply(k),
                         );
                     }
+                } else if phase == launcher::Phase::Exited && exit != Some(0) {
+                    let code = exit.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
+                    let tail = crash_tail.clone().unwrap_or_default();
+                    let panel = Rect::from_center_size(pos2(c.x, c.y + 150.0), vec2(880.0, 280.0));
+                    paint::rect(
+                        &painter,
+                        panel,
+                        paint::cr(14.0),
+                        Color32::from_rgba_premultiplied(16, 16, 29, 240),
+                        Stroke::new(1.0_f32, theme::ACCENT_3.gamma_multiply(0.55)),
+                    );
+                    paint::text(
+                        &painter,
+                        pos2(panel.min.x + 20.0, panel.min.y + 18.0),
+                        &format!("game crashed — exit code {} (this is the JVM/Java error)", code),
+                        theme::display_bold(12.5),
+                        theme::ACCENT_3,
+                    );
+                    let text_rect = Rect::from_min_max(
+                        pos2(panel.min.x + 20.0, panel.min.y + 44.0),
+                        pos2(panel.max.x - 20.0, panel.max.y - 58.0),
+                    );
+                    let copy_text = tail.clone();
+                    let mut y = text_rect.min.y;
+                    for line in tail.lines().take(13) {
+                        let mut t = line.trim().to_string();
+                        if t.is_empty() {
+                            t = " ".to_string();
+                        }
+                        if t.len() > 150 {
+                            t.truncate(150);
+                        }
+                        paint::text_left(&painter, pos2(text_rect.min.x, y), &t, theme::body(11.5), theme::TEXT_DIM);
+                        y += 16.5;
+                    }
+                    let mut crashed_dismiss = false;
+                    let copy_btn = Rect::from_min_size(pos2(panel.min.x + 20.0, panel.max.y - 46.0), vec2(150.0, 34.0));
+                    let cresp = ui.interact(copy_btn, Id::new("crash_copy"), Sense::click());
+                    paint::rect(
+                        &painter,
+                        copy_btn,
+                        paint::cr(8.0),
+                        if cresp.hovered() { theme::ACCENT_1.gamma_multiply(0.5) } else { Color32::from_white_alpha(16) },
+                        Stroke::new(1.0_f32, theme::ACCENT_1.gamma_multiply(0.6)),
+                    );
+                    paint::text(&painter, copy_btn.center(), "COPY REPORT", theme::display_bold(11.0), theme::TEXT);
+                    if cresp.clicked() {
+                        if !copy_text.is_empty() {
+                            ui.ctx().copy_text(copy_text.clone());
+                        }
+                        copy_requested = true;
+                    }
+                    let ok_btn = Rect::from_min_size(pos2(panel.max.x - 170.0, panel.max.y - 46.0), vec2(150.0, 34.0));
+                    let oresp = ui.interact(ok_btn, Id::new("crash_ok"), Sense::click());
+                    paint::rect(
+                        &painter,
+                        ok_btn,
+                        paint::cr(8.0),
+                        if oresp.hovered() { theme::ACCENT_3 } else { theme::ACCENT_2 },
+                        Stroke::NONE,
+                    );
+                    paint::text(&painter, ok_btn.center(), "OK", theme::display_bold(11.0), Color32::WHITE);
+                    if oresp.clicked() {
+                        crashed_dismiss = true;
+                    }
+                    paint::text_left(
+                        &painter,
+                        pos2(panel.min.x + 20.0, panel.max.y - 20.0),
+                        "saved to ~/.aevum-launcher/game/logs/crash-latest.txt",
+                        theme::body(10.5),
+                        theme::TEXT_FAINT,
+                    );
+                    if crashed_dismiss {
+                        dismiss = true;
+                    }
                 } else if phase == launcher::Phase::Exited {
                     let code = exit.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
                     paint::text(
@@ -1659,48 +1805,51 @@ impl AevumApp {
                     );
                 }
 
-                let bar = Rect::from_center_size(pos2(c.x, c.y + 170.0), vec2(300.0, 5.0));
-                painter.rect_filled(bar, paint::cr(5.0), Color32::from_white_alpha(22));
-                if active && pct > 0.0 {
-                    painter.rect_filled(
-                        Rect::from_min_max(bar.min, pos2(bar.min.x + bar.width() * pct, bar.max.y)),
-                        paint::cr(5.0),
-                        theme::ACCENT_1.gamma_multiply(k),
-                    );
-                }
-                let pct_label = if phase == launcher::Phase::Running && pid.is_some() {
-                    format!("{} / {} files", files_done, files_total)
-                } else {
-                    format!("{:.0}%", pct * 100.0)
-                };
-                paint::text(
-                    &painter,
-                    pos2(c.x, bar.max.y + 20.0),
-                    &pct_label,
-                    theme::body(12.0),
-                    theme::TEXT_FAINT.gamma_multiply(k),
-                );
-
-                if !active {
-                    let btn = Rect::from_center_size(pos2(c.x, c.y + 236.0), vec2(220.0, 44.0));
-                    let resp = ui.interact(btn, Id::new("launch_dismiss"), Sense::click());
-                    let hover = resp.hovered();
-                    paint::rect(
-                        &painter,
-                        btn,
-                        paint::cr(999.0),
-                        if hover { theme::ACCENT_3 } else { theme::ACCENT_2 }.gamma_multiply(k),
-                        Stroke::NONE,
-                    );
+                let crash_mode = phase == launcher::Phase::Exited && exit != Some(0);
+                if !crash_mode {
+                    let bar = Rect::from_center_size(pos2(c.x, c.y + 170.0), vec2(300.0, 5.0));
+                    painter.rect_filled(bar, paint::cr(5.0), Color32::from_white_alpha(22));
+                    if active && pct > 0.0 {
+                        painter.rect_filled(
+                            Rect::from_min_max(bar.min, pos2(bar.min.x + bar.width() * pct, bar.max.y)),
+                            paint::cr(5.0),
+                            theme::ACCENT_1.gamma_multiply(k),
+                        );
+                    }
+                    let pct_label = if phase == launcher::Phase::Running && pid.is_some() {
+                        format!("{} / {} files", files_done, files_total)
+                    } else {
+                        format!("{:.0}%", pct * 100.0)
+                    };
                     paint::text(
                         &painter,
-                        btn.center(),
-                        "DISMISS",
-                        theme::display_bold(12.5),
-                        Color32::WHITE.gamma_multiply(k),
+                        pos2(c.x, bar.max.y + 20.0),
+                        &pct_label,
+                        theme::body(12.0),
+                        theme::TEXT_FAINT.gamma_multiply(k),
                     );
-                    if resp.clicked() {
-                        dismiss = true;
+
+                    if !active {
+                        let btn = Rect::from_center_size(pos2(c.x, c.y + 236.0), vec2(220.0, 44.0));
+                        let resp = ui.interact(btn, Id::new("launch_dismiss"), Sense::click());
+                        let hover = resp.hovered();
+                        paint::rect(
+                            &painter,
+                            btn,
+                            paint::cr(999.0),
+                            if hover { theme::ACCENT_3 } else { theme::ACCENT_2 }.gamma_multiply(k),
+                            Stroke::NONE,
+                        );
+                        paint::text(
+                            &painter,
+                            btn.center(),
+                            "DISMISS",
+                            theme::display_bold(12.5),
+                            Color32::WHITE.gamma_multiply(k),
+                        );
+                        if resp.clicked() {
+                            dismiss = true;
+                        }
                     }
                 }
             });
@@ -1709,6 +1858,9 @@ impl AevumApp {
             if let Ok(mut rep) = self.launch_report.lock() {
                 *rep = launcher::LaunchReport::default();
             }
+        }
+        if copy_requested {
+            self.toast("Crash report copied to clipboard".into());
         }
     }
 
